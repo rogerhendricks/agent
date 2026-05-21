@@ -1,4 +1,6 @@
-use anyhow::{Context, Result};
+#![allow(dead_code)]
+
+use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -7,16 +9,13 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-// use std::process::{Command, Stdio};
-// use std::sync::mpsc;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 // =========================================================================
-// 1. DATA STRUCTURES
+// 1. DATA STRUCTURES & CONFIGURATION
 // =========================================================================
-//
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 enum AgentState {
     Idle,
     Listening,
@@ -24,17 +23,45 @@ enum AgentState {
     Speaking(String),
 }
 
-enum AudioMessage {
-    AudioData(Vec<f32>),
-    ProcessAudio,
+#[derive(Clone, Debug)]
+enum LogType {
+    User,
+    Assistant,
+    ToolCall { name: String, args: String },
+    ToolResult { name: String, result: String },
+    SystemInfo,
+    Error(String),
 }
 
-struct AppConfig {
+#[derive(Clone, Debug)]
+struct LogEntry {
+    log_type: LogType,
+    text: String,
+    timestamp: chrono::DateTime<chrono::Local>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AppConfig {
     server_url: String,
     model_name: String,
+    searxng_url: String,
+    n8n_url: String,
 }
 
-#[derive(Serialize)]
+struct AppState {
+    config: AppConfig,
+    logs: Vec<LogEntry>,
+    agent_state: AgentState,
+}
+
+enum AiMessage {
+    AudioData(Vec<f32>),
+    ProcessAudio,
+    TextInput(String),
+}
+
+// Ollama Chat API Structures
+#[derive(Serialize, Clone)]
 struct ChatMessage {
     role: String,
     content: String,
@@ -58,22 +85,185 @@ struct ChatMessageResponse {
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(tag = "action")]
-enum ActionCall {
-    #[serde(rename = "get_time")]
-    GetTime,
-    #[serde(rename = "web_search")]
-    WebSearch { query: String },
+struct GenericActionCall {
+    action: String,
+    #[serde(flatten)]
+    parameters: serde_json::Value,
 }
 
-// The messages our audio thread will send to our main AI thread
-// enum AudioMessage {
-//     AudioData(Vec<f32>),
-//     ProcessAudio,
-// }
+// =========================================================================
+// 2. EXTENSIBLE SKILL TRAIT & REGISTERED SKILLS
+// =========================================================================
+
+pub trait Skill: Send + Sync {
+    /// Unique identifier of the tool (e.g. "get_time", "web_search", "n8n_task")
+    fn name(&self) -> &'static str;
+
+    /// The instruction description to present to the LLM in the system prompt.
+    fn description(&self) -> &'static str;
+
+    /// Execute the skill logic using arguments parsed from the LLM JSON response.
+    fn execute(&self, args: &serde_json::Value, config: &AppConfig) -> Result<String>;
+}
+
+// --- SKILL 1: GET TIME ---
+struct GetTimeSkill;
+impl Skill for GetTimeSkill {
+    fn name(&self) -> &'static str {
+        "get_time"
+    }
+
+    fn description(&self) -> &'static str {
+        "To get the current time or date: {\"action\": \"get_time\"}"
+    }
+
+    fn execute(&self, _args: &serde_json::Value, _config: &AppConfig) -> Result<String> {
+        let time_str = chrono::Local::now()
+            .format("%A, %B %e at %l:%M %p")
+            .to_string();
+        Ok(format!("The current time is {}", time_str))
+    }
+}
+
+// --- SKILL 2: SEARXNG WEB SEARCH ---
+struct WebSearchSkill;
+impl Skill for WebSearchSkill {
+    fn name(&self) -> &'static str {
+        "web_search"
+    }
+
+    fn description(&self) -> &'static str {
+        "To search the web for information: {\"action\": \"web_search\", \"query\": \"<search query>\"}"
+    }
+
+    fn execute(&self, args: &serde_json::Value, config: &AppConfig) -> Result<String> {
+        let query = args.get("query")
+            .and_then(|v| v.as_str())
+            .context("Missing 'query' parameter in web_search call")?;
+
+        let searx_url = if config.searxng_url.is_empty() {
+            "http://localhost:8080".to_string()
+        } else {
+            config.searxng_url.clone()
+        };
+
+        let base_url = format!("{}/search", searx_url.trim_end_matches('/'));
+        let mut url = reqwest::Url::parse(&base_url).context("Failed to parse SearXNG base URL")?;
+        
+        // Safely append query parameters with automatic encoding
+        url.query_pairs_mut()
+            .append_pair("q", query)
+            .append_pair("format", "json");
+
+        let client = reqwest::blocking::Client::new();
+        let res = client.get(url)
+            .send()
+            .context("Failed to connect to SearXNG server")?;
+
+        if !res.status().is_success() {
+            return Err(anyhow!("SearXNG returned error status code: {}", res.status()));
+        }
+
+        let search_res: serde_json::Value = res.json().context("Failed to parse SearXNG JSON response")?;
+        let mut results_summary = String::new();
+
+        if let Some(results) = search_res.get("results").and_then(|r| r.as_array()) {
+            if results.is_empty() {
+                return Ok("No search results were found for this query.".to_string());
+            }
+            for (i, item) in results.iter().take(4).enumerate() {
+                let title = item.get("title").and_then(|t| t.as_str()).unwrap_or("Untitled");
+                let content = item.get("content").and_then(|c| c.as_str()).unwrap_or("No snippet available.");
+                let item_url = item.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                results_summary.push_str(&format!("{}. [{}]({})\n   {}\n\n", i + 1, title, item_url, content));
+            }
+        } else {
+            return Ok("No search results array found in SearXNG response.".to_string());
+        }
+
+        Ok(results_summary)
+    }
+}
+
+// --- SKILL 3: N8N TASK TRIGGER ---
+struct N8nTaskSkill;
+impl Skill for N8nTaskSkill {
+    fn name(&self) -> &'static str {
+        "n8n_task"
+    }
+
+    fn description(&self) -> &'static str {
+        "To trigger a task or automation workflow on n8n (e.g. sending emails, setting calendar events): {\"action\": \"n8n_task\", \"workflow_id\": \"<id or name>\", \"payload\": <JSON object with task details>}"
+    }
+
+    fn execute(&self, args: &serde_json::Value, config: &AppConfig) -> Result<String> {
+        if config.n8n_url.is_empty() {
+            return Err(anyhow!("n8n Webhook URL is not configured in settings!"));
+        }
+
+        let workflow_id = args.get("workflow_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("default");
+        let payload = args.get("payload")
+            .unwrap_or(&serde_json::Value::Null);
+
+        let client = reqwest::blocking::Client::new();
+        let res = client.post(&config.n8n_url)
+            .json(&serde_json::json!({
+                "workflow_id": workflow_id,
+                "payload": payload,
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            }))
+            .send()
+            .context("Failed to dispatch request to n8n webhook")?;
+
+        let status = res.status();
+        let body = res.text().unwrap_or_default();
+
+        Ok(format!("n8n webhook triggered! Status: {}. Response: {}", status, body))
+    }
+}
+
+// --- SKILL REGISTRY CONTAINER ---
+struct SkillRegistry {
+    skills: std::collections::HashMap<String, Box<dyn Skill>>,
+}
+
+impl SkillRegistry {
+    fn new() -> Self {
+        let mut registry = Self {
+            skills: std::collections::HashMap::new(),
+        };
+        registry.register(Box::new(GetTimeSkill));
+        registry.register(Box::new(WebSearchSkill));
+        registry.register(Box::new(N8nTaskSkill));
+        registry
+    }
+
+    fn register(&mut self, skill: Box<dyn Skill>) {
+        self.skills.insert(skill.name().to_string(), skill);
+    }
+
+    fn get(&self, name: &str) -> Option<&Box<dyn Skill>> {
+        self.skills.get(name)
+    }
+
+    fn generate_system_prompt(&self) -> String {
+        let mut prompt = String::from(
+            "You are BMO, a helpful voice assistant. Keep your answers brief, conversational, and user-friendly.\n\
+            You have access to tools. To use a tool, you MUST reply ONLY with a raw JSON object and no other text.\n\
+            Available tools:\n"
+        );
+        for skill in self.skills.values() {
+            prompt.push_str(&format!("- {}\n", skill.description()));
+        }
+        prompt.push_str("If you do not need a tool, just answer normally.");
+        prompt
+    }
+}
 
 // =========================================================================
-// 2. HELPER FUNCTIONS
+// 3. HELPER FUNCTIONS & VOICE SYSTEM
 // =========================================================================
 
 fn clean_json_string(raw: &str) -> String {
@@ -91,24 +281,38 @@ fn clean_json_string(raw: &str) -> String {
 
 fn speak(text: &str) {
     println!("🔊 Speaking: {}", text);
-    let mut piper = Command::new("piper-tts")
+    let piper = Command::new("piper-tts")
         .arg("--model")
-        .arg("./en_US-lessac-medium.onnx")
+        .arg("./bmo.onnx")
         .arg("--output_raw")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .spawn()
-        .expect("Failed to start Piper.");
+        .spawn();
 
-    if let Some(mut piper_stdin) = piper.stdin.take() {
-        piper_stdin
-            .write_all(text.as_bytes())
-            .expect("Failed to write to Piper");
+    let mut piper_process = match piper {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to start piper-tts. Is it installed? Error: {}", e);
+            return;
+        }
+    };
+
+    if let Some(mut piper_stdin) = piper_process.stdin.take() {
+        if let Err(e) = piper_stdin.write_all(text.as_bytes()) {
+            eprintln!("Failed to write text to Piper: {}", e);
+            return;
+        }
     }
 
-    let piper_output = piper.wait_with_output().expect("Failed to wait on Piper");
+    let piper_output = match piper_process.wait_with_output() {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("Failed to wait on Piper execution: {}", e);
+            return;
+        }
+    };
 
-    let mut aplay = Command::new("aplay")
+    let aplay = Command::new("aplay")
         .arg("-r")
         .arg("22050")
         .arg("-f")
@@ -120,205 +324,457 @@ fn speak(text: &str) {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .expect("Failed to start aplay.");
+        .spawn();
 
-    if let Some(mut aplay_stdin) = aplay.stdin.take() {
-        aplay_stdin
-            .write_all(&piper_output.stdout)
-            .expect("Failed to write to aplay");
+    let mut aplay_process = match aplay {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("Failed to start aplay. Is it installed? Error: {}", e);
+            return;
+        }
+    };
+
+    if let Some(mut aplay_stdin) = aplay_process.stdin.take() {
+        if let Err(e) = aplay_stdin.write_all(&piper_output.stdout) {
+            eprintln!("Failed to pipe audio buffer to aplay: {}", e);
+        }
     }
-    aplay.wait().expect("aplay encountered an error");
+    let _ = aplay_process.wait();
+}
+
+fn log_message(app_state: &Arc<Mutex<AppState>>, log_type: LogType, text: &str) {
+    if let Ok(mut state) = app_state.lock() {
+        state.logs.push(LogEntry {
+            log_type,
+            text: text.to_string(),
+            timestamp: chrono::Local::now(),
+        });
+    }
 }
 
 // =========================================================================
-// 3. GUI IMPLEMENTATION
+// 4. GUI IMPLEMENTATION (Egui v0.34 Adopted)
 // =========================================================================
 
 struct AgentApp {
-    state: AgentState,
-    ui_rx: Receiver<AgentState>,
-    config: Arc<Mutex<AppConfig>>,
+    state: Arc<Mutex<AppState>>,
+    manual_input: String,
+    tx: Sender<AiMessage>,
+    first_run: bool,
 }
 
 impl eframe::App for AgentApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Ok(new_state) = self.ui_rx.try_recv() {
-            self.state = new_state;
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+
+        if self.first_run {
+            let mut visuals = egui::Visuals::dark();
+            visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(18, 18, 22);
+            visuals.widgets.noninteractive.fg_stroke.color = egui::Color32::from_rgb(200, 200, 200);
+            visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(28, 28, 36);
+            visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(38, 38, 48);
+            visuals.widgets.active.bg_fill = egui::Color32::from_rgb(48, 48, 62);
+            ctx.set_visuals(visuals);
+            self.first_run = false;
         }
 
-        // NEW: Settings Panel at the top
-        egui::TopBottomPanel::top("settings_panel").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.heading("⚙ Settings");
-                ui.separator();
+        let time = ctx.input(|i| i.time);
 
-                // Lock the mutex to read/write the config safely
-                if let Ok(mut cfg) = self.config.lock() {
-                    ui.label("Ollama URL:");
-                    ui.add(egui::TextEdit::singleline(&mut cfg.server_url).desired_width(200.0));
+        // Lock AppState for UI drawing
+        if let Ok(mut state) = self.state.lock() {
+            let current_state = state.agent_state.clone();
+            
+            // LEFT PANEL: Face visualizer and quick guide (Egui v0.34 compliant)
+            egui::Panel::left("visualizer_panel")
+                .resizable(false)
+                .default_size(320.0)
+                .show_inside(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(20.0);
+                        ui.heading(
+                            egui::RichText::new("👾 BMO AGENT")
+                                .strong()
+                                .color(egui::Color32::from_rgb(0, 230, 115))
+                                .size(24.0)
+                        );
+                        ui.add_space(15.0);
 
-                    ui.label("Model:");
-                    ui.add(egui::TextEdit::singleline(&mut cfg.model_name).desired_width(100.0));
-                }
+                        // Visualizer Screen Frame
+                        let size = egui::vec2(280.0, 240.0);
+                        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                        let center = rect.center();
+                        let painter = ui.painter_at(rect);
+
+                        // Base layout dimensions
+                        let eye_spacing = 80.0;
+                        let eye_y_offset = -20.0;
+                        let mouth_y_offset = 35.0;
+
+                        // Dynamics depending on AgentState
+                        let blink_scale;
+                        let look_offset;
+                        let smile_curve;
+                        let mouth_openness;
+                        let mouth_w;
+                        let face_color;
+                        let text_label;
+                        let glow_radius;
+
+                        match &current_state {
+                            AgentState::Idle => {
+                                blink_scale = if (time % 5.0) < 0.15 { 0.1 } else { 1.0 };
+                                look_offset = egui::Vec2::ZERO;
+                                smile_curve = 10.0;
+                                mouth_openness = 0.0;
+                                mouth_w = 60.0 + 5.0 * (time * 1.2).sin() as f32;
+                                face_color = egui::Color32::from_rgb(120, 130, 160);
+                                text_label = "IDLE";
+                                glow_radius = 110.0 + 5.0 * (time * 1.5).sin() as f32;
+                            }
+                            AgentState::Listening => {
+                                blink_scale = 1.0;
+                                look_offset = egui::Vec2::ZERO;
+                                smile_curve = 0.0;
+                                mouth_openness = 12.0 + 4.0 * (time * 8.0).sin() as f32;
+                                mouth_w = 30.0;
+                                face_color = egui::Color32::from_rgb(0, 200, 255);
+                                text_label = "LISTENING";
+                                glow_radius = 120.0 + 10.0 * (time * 8.0).cos().abs() as f32;
+                            }
+                            AgentState::Thinking => {
+                                blink_scale = if (time % 5.0) < 0.15 { 0.1 } else { 1.0 };
+                                look_offset = egui::vec2(15.0 * (time * 3.0).sin() as f32, -5.0);
+                                smile_curve = -5.0;
+                                mouth_openness = 0.0;
+                                mouth_w = 40.0;
+                                face_color = egui::Color32::from_rgb(255, 170, 0);
+                                text_label = "THINKING";
+                                glow_radius = 115.0 + 6.0 * (time * 4.0).sin() as f32;
+                            }
+                            AgentState::Speaking(_) => {
+                                blink_scale = if (time % 5.0) < 0.15 { 0.1 } else { 1.0 };
+                                look_offset = egui::Vec2::ZERO;
+                                let talk_wave = (time * 25.0).sin().abs() as f32 * 0.8
+                                    + (time * 12.0).cos().abs() as f32 * 0.2;
+                                smile_curve = 8.0;
+                                mouth_openness = 4.0 + 25.0 * talk_wave;
+                                mouth_w = 55.0 + 10.0 * (time * 6.0).cos() as f32;
+                                face_color = egui::Color32::from_rgb(0, 230, 115);
+                                text_label = "SPEAKING";
+                                glow_radius = 120.0 + 12.0 * talk_wave;
+                            }
+                        }
+
+                        // Draw screen background & outline using version-stable overlapping filled rectangles
+                        let screen_rect = rect.shrink(5.0);
+                        painter.rect_filled(screen_rect, 15.0, face_color);
+                        let inner_screen_rect = screen_rect.shrink(2.5);
+                        painter.rect_filled(inner_screen_rect, 13.0, egui::Color32::from_rgb(15, 20, 28));
+
+                        // Glowing inner aura
+                        let glow_color = egui::Color32::from_rgba_unmultiplied(
+                            face_color.r(),
+                            face_color.g(),
+                            face_color.b(),
+                            12,
+                        );
+                        painter.circle_filled(center, glow_radius, glow_color);
+
+                        // Draw Eyes (using cross-version stable circle_filled)
+                        let left_eye_center = center + egui::vec2(-eye_spacing / 2.0, eye_y_offset) + look_offset;
+                        let right_eye_center = center + egui::vec2(eye_spacing / 2.0, eye_y_offset) + look_offset;
+                        let eye_radius = 13.0;
+
+                        painter.circle_filled(left_eye_center, eye_radius * blink_scale, face_color);
+                        painter.circle_filled(right_eye_center, eye_radius * blink_scale, face_color);
+
+                        // Draw Mouth
+                        let mouth_center = center + egui::vec2(0.0, mouth_y_offset);
+                        if mouth_openness <= 2.0 {
+                            let p0 = mouth_center + egui::vec2(-mouth_w / 2.0, 0.0);
+                            let p2 = mouth_center + egui::vec2(mouth_w / 2.0, 0.0);
+                            let p1 = mouth_center + egui::vec2(0.0, smile_curve);
+
+                            let mut points = vec![];
+                            for i in 0..=10 {
+                                let t = i as f32 / 10.0;
+                                let u = 1.0 - t;
+                                let x = u * u * p0.x + 2.0 * u * t * p1.x + t * t * p2.x;
+                                let y = u * u * p0.y + 2.0 * u * t * p1.y + t * t * p2.y;
+                                points.push(egui::pos2(x, y));
+                            }
+                            painter.add(egui::epaint::PathShape::line(
+                                points,
+                                egui::Stroke::new(8.0, face_color),
+                            ));
+                        } else {
+                            // Rounded capsule rectangle represents open mouth perfectly in all Egui versions
+                            let mouth_rect = egui::Rect::from_center_size(
+                                mouth_center + egui::vec2(0.0, smile_curve / 2.0),
+                                egui::vec2(mouth_w, mouth_openness * 2.0)
+                            );
+                            painter.rect_filled(mouth_rect, mouth_openness, face_color);
+                        }
+
+                        ui.add_space(20.0);
+
+                        // Dynamic status chip
+                        let chip_bg = match &current_state {
+                            AgentState::Idle => egui::Color32::from_rgb(30, 35, 45),
+                            AgentState::Listening => egui::Color32::from_rgb(0, 50, 80),
+                            AgentState::Thinking => egui::Color32::from_rgb(80, 50, 0),
+                            AgentState::Speaking(_) => egui::Color32::from_rgb(0, 60, 30),
+                        };
+
+                        egui::Frame::NONE
+                            .fill(chip_bg)
+                            .corner_radius(14)
+                            .inner_margin(egui::Margin::symmetric(24, 8))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(text_label)
+                                        .strong()
+                                        .color(face_color)
+                                        .size(15.0)
+                                );
+                            });
+
+                        ui.add_space(25.0);
+                        ui.separator();
+                        ui.add_space(20.0);
+
+                        // Help details
+                        ui.label(egui::RichText::new("Voice Operations:").strong().color(egui::Color32::GRAY));
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("🎙 Active mic: Start speaking\n⏱ Pauses trigger LLM processing\n💬 Type in textbox below to chat")
+                                .weak()
+                                .size(11.5)
+                        );
+                    });
+                });
+
+            // TOP PANEL: Server & URL Configuration (Collapsible)
+            egui::Panel::top("top_settings_panel")
+                .show_inside(ui, |ui| {
+                    ui.add_space(6.0);
+                    ui.collapsing("⚙ Settings & Server Configuration", |ui| {
+                        ui.add_space(4.0);
+                        egui::Grid::new("settings_grid")
+                            .num_columns(2)
+                            .spacing([12.0, 8.0])
+                            .striped(true)
+                            .show(ui, |ui| {
+                                ui.label("Ollama URL:");
+                                ui.add(egui::TextEdit::singleline(&mut state.config.server_url).desired_width(450.0));
+                                ui.end_row();
+
+                                ui.label("Model Name:");
+                                ui.add(egui::TextEdit::singleline(&mut state.config.model_name).desired_width(220.0));
+                                ui.end_row();
+
+                                ui.label("SearXNG URL:");
+                                ui.add(egui::TextEdit::singleline(&mut state.config.searxng_url).desired_width(450.0));
+                                ui.end_row();
+
+                                ui.label("n8n Webhook URL:");
+                                ui.add(egui::TextEdit::singleline(&mut state.config.n8n_url).desired_width(450.0));
+                                ui.end_row();
+                            });
+                        ui.add_space(6.0);
+                    });
+                    ui.add_space(4.0);
+                });
+
+            // BOTTOM PANEL: Text Chat Box
+            egui::Panel::bottom("bottom_input_panel")
+                .show_inside(ui, |ui| {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let text_edit = egui::TextEdit::singleline(&mut self.manual_input)
+                            .hint_text("Type a message or ask BMO to trigger a skill...")
+                            .desired_width(ui.available_width() - 160.0);
+
+                        let response = ui.add(text_edit);
+                        let is_enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                        let send_btn = ui.add(
+                            egui::Button::new(egui::RichText::new("Send 🚀").strong())
+                                .min_size(egui::vec2(75.0, 30.0))
+                        );
+
+                        if (is_enter || send_btn.clicked()) && !self.manual_input.trim().is_empty() {
+                            let text = self.manual_input.trim().to_string();
+                            let _ = self.tx.send(AiMessage::TextInput(text));
+                            self.manual_input.clear();
+                        }
+
+                        if ui.button("Clear Logs").clicked() {
+                            state.logs.clear();
+                            state.logs.push(LogEntry {
+                                log_type: LogType::SystemInfo,
+                                text: "Logs cleared.".to_string(),
+                                timestamp: chrono::Local::now(),
+                            });
+                        }
+                    });
+                    ui.add_space(8.0);
+                });
+
+            // CENTRAL PANEL: Scrollable Live Logs drawn directly inside `ui`
+            ui.vertical(|ui| {
+                ui.add_space(4.0);
+                ui.heading("📝 Live Activity & Conversation Logs");
+                ui.add_space(6.0);
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for entry in &state.logs {
+                            draw_log_card(ui, entry);
+                        }
+                    });
             });
-            ui.add_space(4.0);
-        });
+        }
 
-        // The face visualization
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let time = ui.input(|i| i.time);
-            let rect = ui.available_rect_before_wrap();
-            let center = rect.center();
-            let painter = ui.painter();
-
-            let eye_spacing = 110.0;
-            let eye_y_offset = -30.0;
-            let mouth_y_offset = 50.0;
-
-            let mut blink_scale = if (time % 4.0) < 0.15 { 0.1 } else { 1.0 };
-            let mut look_offset = egui::Vec2::ZERO;
-            let mut smile_curve = 0.0;
-            let mut mouth_openness = 0.0;
-            let mut mouth_w = 60.0;
-            let mut face_color = egui::Color32::WHITE;
-            let mut text_label = "Idle";
-
-            match &self.state {
-                AgentState::Idle => {
-                    smile_curve = 15.0;
-                    mouth_w = 80.0 + 10.0 * (time * 1.5).sin() as f32;
-                    face_color = egui::Color32::from_rgb(180, 180, 200);
-                    text_label = "Idle";
-                }
-                AgentState::Listening => {
-                    blink_scale = 1.1;
-                    mouth_openness = 20.0 + 5.0 * (time * 10.0).sin() as f32;
-                    mouth_w = 35.0;
-                    face_color = egui::Color32::from_rgb(0, 200, 255);
-                    text_label = "Listening...";
-                }
-                AgentState::Thinking => {
-                    look_offset = egui::vec2(20.0 * (time * 4.0).sin() as f32, -10.0);
-                    smile_curve = -10.0 * (time * 2.0).sin() as f32;
-                    mouth_w = 50.0;
-                    face_color = egui::Color32::from_rgb(255, 180, 0);
-                    text_label = "Thinking...";
-                }
-                AgentState::Speaking(text) => {
-                    let talk_wave = (time * 30.0).sin().abs() as f32 * 0.7
-                        + (time * 17.0).cos().abs() as f32 * 0.3;
-                    mouth_openness = 5.0 + 40.0 * talk_wave;
-                    mouth_w = 70.0 + 15.0 * (time * 8.0).cos() as f32;
-                    smile_curve = 10.0;
-                    face_color = egui::Color32::from_rgb(50, 255, 100);
-                    text_label = text;
-                }
-            }
-
-            let glow_color = egui::Color32::from_rgba_unmultiplied(
-                face_color.r(),
-                face_color.g(),
-                face_color.b(),
-                15,
-            );
-            painter.circle_filled(center, 160.0, glow_color);
-
-            let left_eye_center =
-                center + egui::vec2(-eye_spacing / 2.0, eye_y_offset) + look_offset;
-            let right_eye_center =
-                center + egui::vec2(eye_spacing / 2.0, eye_y_offset) + look_offset;
-            let eye_size = egui::vec2(18.0, 18.0 * blink_scale);
-
-            painter.ellipse_filled(left_eye_center, eye_size, face_color);
-            painter.ellipse_filled(right_eye_center, eye_size, face_color);
-
-            let mouth_center = center + egui::vec2(0.0, mouth_y_offset);
-
-            if mouth_openness <= 2.0 {
-                let p0 = mouth_center + egui::vec2(-mouth_w / 2.0, 0.0);
-                let p2 = mouth_center + egui::vec2(mouth_w / 2.0, 0.0);
-                let p1 = mouth_center + egui::vec2(0.0, smile_curve);
-
-                let mut points = vec![];
-                for i in 0..=10 {
-                    let t = i as f32 / 10.0;
-                    let u = 1.0 - t;
-                    let x = u * u * p0.x + 2.0 * u * t * p1.x + t * t * p2.x;
-                    let y = u * u * p0.y + 2.0 * u * t * p1.y + t * t * p2.y;
-                    points.push(egui::pos2(x, y));
-                }
-                painter.add(egui::epaint::PathShape::line(
-                    points,
-                    egui::Stroke::new(14.0, face_color),
-                ));
-            } else {
-                painter.ellipse_filled(
-                    mouth_center + egui::vec2(0.0, smile_curve / 2.0),
-                    egui::vec2(mouth_w / 2.0, mouth_openness),
-                    face_color,
-                );
-            }
-
-            let text_pos = egui::pos2(center.x, center.y + 180.0);
-            painter.text(
-                text_pos,
-                egui::Align2::CENTER_CENTER,
-                text_label,
-                egui::FontId::proportional(28.0),
-                face_color,
-            );
-        });
-
+        // Keep UI animating for continuous face visualization breathing/mouth movements
         ctx.request_repaint();
     }
 }
 
-// =========================================================================
-// 4. MAIN ENTRY & BACKGROUND AI THREAD
-// =========================================================================
-fn main() -> Result<(), eframe::Error> {
-    let (ui_tx, ui_rx) = mpsc::channel::<AgentState>();
+fn draw_log_card(ui: &mut egui::Ui, entry: &LogEntry) {
+    let (bg_color, stroke_color, fg_color, icon, title) = match &entry.log_type {
+        LogType::User => (
+            egui::Color32::from_rgba_unmultiplied(0, 150, 255, 22),
+            egui::Color32::from_rgb(0, 150, 255),
+            egui::Color32::from_rgb(205, 235, 255),
+            "👤",
+            "You",
+        ),
+        LogType::Assistant => (
+            egui::Color32::from_rgba_unmultiplied(0, 230, 115, 22),
+            egui::Color32::from_rgb(0, 230, 115),
+            egui::Color32::from_rgb(210, 255, 230),
+            "🤖",
+            "BMO Agent",
+        ),
+        LogType::ToolCall { name, .. } => (
+            egui::Color32::from_rgba_unmultiplied(255, 170, 0, 18),
+            egui::Color32::from_rgb(255, 170, 0),
+            egui::Color32::from_rgb(255, 230, 180),
+            "⚙️",
+            name.as_str(),
+        ),
+        LogType::ToolResult { name, .. } => (
+            egui::Color32::from_rgba_unmultiplied(255, 170, 0, 12),
+            egui::Color32::from_rgb(210, 150, 0),
+            egui::Color32::from_rgb(240, 225, 190),
+            "📊",
+            name.as_str(),
+        ),
+        LogType::SystemInfo => (
+            egui::Color32::from_rgba_unmultiplied(150, 150, 150, 18),
+            egui::Color32::from_rgb(160, 160, 160),
+            egui::Color32::from_rgb(225, 225, 225),
+            "ℹ️",
+            "System Information",
+        ),
+        LogType::Error(_) => (
+            egui::Color32::from_rgba_unmultiplied(255, 50, 50, 22),
+            egui::Color32::from_rgb(255, 60, 60),
+            egui::Color32::from_rgb(255, 215, 215),
+            "⚠️",
+            "Error",
+        ),
+    };
 
-    // NEW: Initialize the shared configuration
-    let shared_config = Arc::new(Mutex::new(AppConfig {
-        server_url: "http://127.0.0.1:11434/api/chat".to_string(), // Default fallback
-        model_name: "llama3".to_string(),
+    egui::Frame::NONE
+        .fill(bg_color)
+        .stroke(egui::Stroke::new(1.0, stroke_color))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(8, 8))
+        .outer_margin(egui::Margin::symmetric(0, 4))
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("{} {}", icon, title)).strong().color(stroke_color));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(entry.timestamp.format("%H:%M:%S").to_string())
+                                .weak()
+                                .size(10.0)
+                        );
+                    });
+                });
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(&entry.text).color(fg_color));
+            });
+        });
+}
+
+// =========================================================================
+// 5. MAIN ENTRY & BACKGROUND AI THREAD
+// =========================================================================
+
+fn main() -> Result<(), eframe::Error> {
+    let shared_state = Arc::new(Mutex::new(AppState {
+        config: AppConfig {
+            server_url: "http://127.0.0.1:11434/api/chat".to_string(),
+            model_name: "llama3".to_string(),
+            searxng_url: "http://localhost:8080".to_string(),
+            n8n_url: "".to_string(),
+        },
+        logs: vec![LogEntry {
+            log_type: LogType::SystemInfo,
+            text: "System loaded. BMO is ready to help!".to_string(),
+            timestamp: chrono::Local::now(),
+        }],
+        agent_state: AgentState::Idle,
     }));
 
-    // Clone the Arc pointer to pass into the background AI thread
-    let ai_config = shared_config.clone();
+    let (ai_tx, ai_rx) = mpsc::channel::<AiMessage>();
 
+    let ai_state = shared_state.clone();
+    let ai_tx_for_audio = ai_tx.clone();
+
+    // Spawn AI Pipeline Background thread
     thread::spawn(move || {
-        if let Err(e) = run_ai_pipeline(ui_tx, ai_config) {
+        if let Err(e) = run_ai_pipeline(ai_state, ai_rx, ai_tx_for_audio) {
             eprintln!("AI Pipeline crashed: {}", e);
         }
     });
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([800.0, 600.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1150.0, 720.0])
+            .with_min_inner_size([850.0, 500.0]),
         ..Default::default()
     };
 
+    let app_state = shared_state.clone();
     eframe::run_native(
-        "Agent GUI",
+        "BMO Console Agent",
         options,
-        // Pass the remaining shared_config pointer to the GUI
-        Box::new(|_cc| {
+        Box::new(move |_cc| {
             Ok(Box::new(AgentApp {
-                state: AgentState::Idle,
-                ui_rx,
-                config: shared_config,
+                state: app_state,
+                manual_input: String::new(),
+                tx: ai_tx,
+                first_run: true,
             }))
         }),
     )
 }
 
-fn run_ai_pipeline(ui_tx: Sender<AgentState>, config: Arc<Mutex<AppConfig>>) -> Result<()> {
+fn run_ai_pipeline(
+    app_state: Arc<Mutex<AppState>>,
+    audio_rx: Receiver<AiMessage>,
+    audio_tx: Sender<AiMessage>,
+) -> Result<()> {
     println!("🤖 Loading Whisper Model...");
     let ctx_params = WhisperContextParameters::default();
-    let mut ctx = WhisperContext::new_with_params("ggml-tiny.en.bin", ctx_params)
+    let ctx = WhisperContext::new_with_params("ggml-tiny.en.bin", ctx_params)
         .context("Failed to load Whisper model")?;
     let mut state = ctx.create_state().context("Failed to create state")?;
 
@@ -331,17 +787,29 @@ fn run_ai_pipeline(ui_tx: Sender<AgentState>, config: Arc<Mutex<AppConfig>>) -> 
         buffer_size: cpal::BufferSize::Default,
     };
 
-    let (audio_tx, audio_rx) = mpsc::channel::<AudioMessage>();
-
     let mut is_recording = false;
     let mut silence_frames = 0;
     let silence_threshold = 16000;
 
-    let ui_tx_audio = ui_tx.clone();
+    let audio_tx_clone = audio_tx.clone();
+    let app_state_audio = app_state.clone();
 
     let stream = device.build_input_stream(
         &stream_config,
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
+            // Bypass input checks if BMO is currently playing audio TTS
+            let is_speaking = {
+                if let Ok(state) = app_state_audio.try_lock() {
+                    matches!(state.agent_state, AgentState::Speaking(_))
+                } else {
+                    false
+                }
+            };
+
+            if is_speaking {
+                return;
+            }
+
             let mut sum_squares = 0.0;
             for &sample in data {
                 sum_squares += sample * sample;
@@ -350,7 +818,9 @@ fn run_ai_pipeline(ui_tx: Sender<AgentState>, config: Arc<Mutex<AppConfig>>) -> 
 
             if rms > 0.015 {
                 if !is_recording {
-                    let _ = ui_tx_audio.send(AgentState::Listening);
+                    if let Ok(mut state) = app_state_audio.lock() {
+                        state.agent_state = AgentState::Listening;
+                    }
                     is_recording = true;
                 }
                 silence_frames = 0;
@@ -359,13 +829,13 @@ fn run_ai_pipeline(ui_tx: Sender<AgentState>, config: Arc<Mutex<AppConfig>>) -> 
             }
 
             if is_recording {
-                let _ = audio_tx.send(AudioMessage::AudioData(data.to_vec()));
+                let _ = audio_tx_clone.send(AiMessage::AudioData(data.to_vec()));
             }
 
             if is_recording && silence_frames > silence_threshold {
                 is_recording = false;
                 silence_frames = 0;
-                let _ = audio_tx.send(AudioMessage::ProcessAudio);
+                let _ = audio_tx_clone.send(AiMessage::ProcessAudio);
             }
         },
         |err| eprintln!("Audio stream error: {}", err),
@@ -374,30 +844,32 @@ fn run_ai_pipeline(ui_tx: Sender<AgentState>, config: Arc<Mutex<AppConfig>>) -> 
 
     stream.play()?;
 
-    let mut audio_buffer: Vec<f32> = Vec::new();
-
-    let system_prompt = r#"
-You are a helpful voice assistant. Keep your answers brief and conversational.
-You have access to tools. To use a tool, you MUST reply ONLY with a raw JSON object and no other text.
-Available tools:
-- To get the current time or date, output: {"action": "get_time"}
-If you do not need a tool, just answer normally.
-"#.trim().to_string();
+    // Skill system setup
+    let registry = SkillRegistry::new();
+    let system_prompt = registry.generate_system_prompt();
 
     let mut messages = vec![ChatMessage {
         role: "system".to_string(),
         content: system_prompt.clone(),
     }];
+
     let client = reqwest::blocking::Client::new();
     let max_context_messages = 11;
+    let mut audio_buffer: Vec<f32> = Vec::new();
+
+    println!("🎧 Audio Listener Stream Active.");
 
     for message in audio_rx {
         match message {
-            AudioMessage::AudioData(data) => {
+            AiMessage::AudioData(data) => {
                 audio_buffer.extend(data);
             }
-            AudioMessage::ProcessAudio => {
-                let _ = ui_tx.send(AgentState::Thinking);
+            AiMessage::ProcessAudio => {
+                {
+                    if let Ok(mut state) = app_state.lock() {
+                        state.agent_state = AgentState::Thinking;
+                    }
+                }
 
                 let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
                 params.set_language(Some("en"));
@@ -407,7 +879,8 @@ If you do not need a tool, just answer normally.
                 params.set_print_timestamps(false);
 
                 if let Err(e) = state.full(params, &audio_buffer[..]) {
-                    eprintln!("Whisper error: {}", e);
+                    let err_msg = format!("Whisper transcription failed: {}", e);
+                    log_message(&app_state, LogType::Error(err_msg.clone()), &err_msg);
                 } else {
                     let num_segments = state.full_n_segments();
                     let mut full_text = String::new();
@@ -422,298 +895,211 @@ If you do not need a tool, just answer normally.
 
                     let user_text = full_text.trim();
                     if !user_text.is_empty() {
-                        messages.push(ChatMessage {
-                            role: "user".to_string(),
-                            content: user_text.to_string(),
-                        });
-
-                        // NEW: Read the latest config right before making the network request
-                        let (current_url, current_model) = {
-                            let cfg = config.lock().unwrap();
-                            (cfg.server_url.clone(), cfg.model_name.clone())
-                        };
-
-                        loop {
-                            if messages.len() > max_context_messages {
-                                let mut truncated = vec![messages[0].clone()];
-                                let recent_start_idx = messages.len() - (max_context_messages - 1);
-                                truncated.extend_from_slice(&messages[recent_start_idx..]);
-                                messages = truncated;
-                            }
-
-                            // Use the dynamically loaded model name
-                            let request_body = ChatRequest {
-                                model: current_model.clone(),
-                                messages: messages.clone(),
-                                stream: false,
-                            };
-
-                            // Use the dynamically loaded URL
-                            match client.post(&current_url).json(&request_body).send() {
-                                Ok(res) => {
-                                    if let Ok(chat_res) = res.json::<ChatResponse>() {
-                                        let raw_reply = chat_res.message.content.trim();
-                                        let cleaned_reply = clean_json_string(raw_reply);
-
-                                        if let Ok(action_call) =
-                                            serde_json::from_str::<ActionCall>(&cleaned_reply)
-                                        {
-                                            match action_call {
-                                                ActionCall::GetTime => {
-                                                    let time_str = chrono::Local::now()
-                                                        .format("%A, %B %e at %l:%M %p")
-                                                        .to_string();
-                                                    messages.push(ChatMessage {
-                                                        role: "assistant".to_string(),
-                                                        content: raw_reply.to_string(),
-                                                    });
-                                                    messages.push(ChatMessage { role: "user".to_string(), content: format!("System tool observation: The current time is {}. Please tell me the time conversationally.", time_str) });
-                                                    continue;
-                                                }
-                                                ActionCall::WebSearch { query: _ } => {
-                                                    continue;
-                                                }
-                                            }
-                                        } else {
-                                            let _ = ui_tx
-                                                .send(AgentState::Speaking(raw_reply.to_string()));
-                                            speak(raw_reply);
-                                            messages.push(ChatMessage {
-                                                role: "assistant".to_string(),
-                                                content: raw_reply.to_string(),
-                                            });
-                                            break;
-                                        }
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("Network error to {}: {}", current_url, e);
-                                    break;
-                                }
-                            }
-                        }
+                        process_user_message(
+                            &app_state,
+                            &registry,
+                            &client,
+                            &mut messages,
+                            max_context_messages,
+                            user_text,
+                        );
                     }
                 }
 
                 audio_buffer.clear();
-                let _ = ui_tx.send(AgentState::Idle);
+                {
+                    if let Ok(mut state) = app_state.lock() {
+                        state.agent_state = AgentState::Idle;
+                    }
+                }
+            }
+            AiMessage::TextInput(text) => {
+                let user_text = text.trim();
+                if !user_text.is_empty() {
+                    audio_buffer.clear(); // Flush audio queue
+                    {
+                        if let Ok(mut state) = app_state.lock() {
+                            state.agent_state = AgentState::Thinking;
+                        }
+                    }
+
+                    process_user_message(
+                        &app_state,
+                        &registry,
+                        &client,
+                        &mut messages,
+                        max_context_messages,
+                        user_text,
+                    );
+
+                    {
+                        if let Ok(mut state) = app_state.lock() {
+                            state.agent_state = AgentState::Idle;
+                        }
+                    }
+                }
             }
         }
     }
     Ok(())
 }
-// fn main() -> Result<()> {
-//     println!("🤖 Loading Whisper Model...");
-//     let ctx_params = WhisperContextParameters::default();
-//     // Ensure you downloaded ggml-tiny.en.bin to your project root!
-//     let mut ctx = WhisperContext::new_with_params("ggml-tiny.en.bin", ctx_params)
-//         .context("Failed to load Whisper model")?;
-//     let mut state = ctx.create_state().context("Failed to create state")?;
 
-//     let host = cpal::default_host();
-//     let device = host.default_input_device().context("No microphone found")?;
-//     println!("🎙️  Using mic: {}", device.name()?);
+fn process_user_message(
+    app_state: &Arc<Mutex<AppState>>,
+    registry: &SkillRegistry,
+    client: &reqwest::blocking::Client,
+    messages: &mut Vec<ChatMessage>,
+    max_context_messages: usize,
+    user_text: &str,
+) {
+    // 1. Log the user's transcript
+    log_message(app_state, LogType::User, user_text);
 
-//     // We explicitly request 16kHz Mono audio because Whisper requires it.
-//     // PipeWire/ALSA on Arch Linux will automatically resample the hardware input to match this.
-//     let config = cpal::StreamConfig {
-//         channels: 1,
-//         sample_rate: 16000,
-//         buffer_size: cpal::BufferSize::Default,
-//     };
+    // 2. Feed to chat context
+    messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: user_text.to_string(),
+    });
 
-//     // Create a channel to send audio from the fast callback thread to the main processing thread
-//     let (tx, rx) = mpsc::channel::<AudioMessage>();
+    let mut max_iterations = 5;
+    while max_iterations > 0 {
+        max_iterations -= 1;
 
-//     // VAD State variables to be moved into the closure
-//     let mut is_recording = false;
-//     let mut silence_frames = 0;
-//     // 16000 samples = 1 second of audio. We wait for 1 second of silence before processing.
-//     let silence_threshold = 16000;
+        // Truncate context if it gets too large
+        if messages.len() > max_context_messages {
+            let mut truncated = vec![messages[0].clone()];
+            let recent_start_idx = messages.len() - (max_context_messages - 1);
+            truncated.extend_from_slice(&messages[recent_start_idx..]);
+            *messages = truncated;
+        }
 
-//     let stream = device.build_input_stream(
-//         &config,
-//         move |data: &[f32], _: &cpal::InputCallbackInfo| {
-//             // Calculate RMS volume
-//             let mut sum_squares = 0.0;
-//             for &sample in data {
-//                 sum_squares += sample * sample;
-//             }
-//             let rms = (sum_squares / data.len() as f32).sqrt();
+        let (current_url, current_model) = {
+            if let Ok(state) = app_state.lock() {
+                (state.config.server_url.clone(), state.config.model_name.clone())
+            } else {
+                break;
+            }
+        };
 
-//             let volume_threshold = 0.015; // Tweak this if your mic is too sensitive/quiet
+        let request_body = ChatRequest {
+            model: current_model,
+            messages: messages.clone(),
+            stream: false,
+        };
 
-//             if rms > volume_threshold {
-//                 if !is_recording {
-//                     println!("\n🗣️  Voice detected! Listening...");
-//                     is_recording = true;
-//                 }
-//                 silence_frames = 0; // Reset silence counter because we heard noise
-//             } else if is_recording {
-//                 silence_frames += data.len();
-//             }
+        match client.post(&current_url).json(&request_body).send() {
+            Ok(res) => {
+                if !res.status().is_success() {
+                    let err_msg = format!("Ollama server returned error status: {}", res.status());
+                    log_message(app_state, LogType::Error(err_msg.clone()), &err_msg);
+                    break;
+                }
 
-//             // If we are currently in a recording state, send the audio chunk to the main thread
-//             if is_recording {
-//                 tx.send(AudioMessage::AudioData(data.to_vec())).unwrap();
-//             }
+                if let Ok(chat_res) = res.json::<ChatResponse>() {
+                    let raw_reply = chat_res.message.content.trim();
+                    let cleaned_reply = clean_json_string(raw_reply);
 
-//             // If we've been silent long enough, trigger processing
-//             if is_recording && silence_frames > silence_threshold {
-//                 is_recording = false;
-//                 silence_frames = 0;
-//                 tx.send(AudioMessage::ProcessAudio).unwrap();
-//             }
-//         },
-//         |err| eprintln!("Audio stream error: {}", err),
-//         None,
-//     )?;
+                    // Inspect if response is a JSON Tool Call
+                    if let Ok(action_call) = serde_json::from_str::<GenericActionCall>(&cleaned_reply) {
+                        let tool_name = action_call.action.clone();
+                        let tool_args = action_call.parameters.to_string();
 
-//     stream.play()?;
-//     println!(
-//         "🎧 Ready! Speak into the microphone. Pausing for 1 second will trigger transcription."
-//     );
+                        log_message(
+                            app_state,
+                            LogType::ToolCall {
+                                name: tool_name.clone(),
+                                args: tool_args,
+                            },
+                            &format!("🤖 Triggering skill '{}'...", tool_name),
+                        );
 
-//     // --- MAIN AI THREAD ---
-//     let mut audio_buffer: Vec<f32> = Vec::new();
+                        let skill_result = if let Some(skill) = registry.get(&tool_name) {
+                            let current_config = {
+                                if let Ok(state) = app_state.lock() {
+                                    state.config.clone()
+                                } else {
+                                    break;
+                                }
+                            };
+                            skill.execute(&action_call.parameters, &current_config)
+                        } else {
+                            Err(anyhow!("Skill '{}' not found in registry.", tool_name))
+                        };
 
-//     // Listen to the channel forever
-//     for message in rx {
-//         match message {
-//             AudioMessage::AudioData(data) => {
-//                 audio_buffer.extend(data);
-//             }
-//             AudioMessage::ProcessAudio => {
-//                 println!("⏳ Processing {} samples...", audio_buffer.len());
+                        match skill_result {
+                            Ok(result_str) => {
+                                log_message(
+                                    app_state,
+                                    LogType::ToolResult {
+                                        name: tool_name.clone(),
+                                        result: result_str.clone(),
+                                    },
+                                    &format!("Skill '{}' completed successfully.", tool_name),
+                                );
 
-//                 let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-//                 params.set_language(Some("en"));
-//                 params.set_print_progress(false);
-//                 params.set_print_special(false);
-//                 params.set_print_realtime(false);
-//                 params.set_print_timestamps(false);
+                                // Feed result back into conversation history
+                                messages.push(ChatMessage {
+                                    role: "assistant".to_string(),
+                                    content: raw_reply.to_string(),
+                                });
 
-//                 if let Err(e) = state.full(params, &audio_buffer[..]) {
-//                     eprintln!("Whisper error: {}", e);
-//                 } else {
-//                     // 1. full_n_segments() returns i32 directly now
-//                     let num_segments = state.full_n_segments();
-//                     let mut full_text = String::new();
+                                messages.push(ChatMessage {
+                                    role: "user".to_string(),
+                                    content: format!(
+                                        "System tool observation for '{}': {}. Explain this to the user conversationally.",
+                                        tool_name, result_str
+                                    ),
+                                });
 
-//                     for i in 0..num_segments {
-//                         // 2. The new v0.16.0 API uses get_segment(i)
-//                         if let Some(segment) = state.get_segment(i) {
-//                             // 3. Extract the UTF-8 string from the segment
-//                             if let Ok(text) = segment.to_str() {
-//                                 full_text.push_str(text);
-//                             }
-//                         }
-//                     }
+                                // Loop back to have model create the conversational final reply
+                                continue;
+                            }
+                            Err(e) => {
+                                let err_msg = format!("Skill '{}' failed: {}", tool_name, e);
+                                log_message(app_state, LogType::Error(err_msg.clone()), &err_msg);
 
-//                     println!("📝 You said: \"{}\"", full_text.trim());
+                                messages.push(ChatMessage {
+                                    role: "assistant".to_string(),
+                                    content: raw_reply.to_string(),
+                                });
 
-//                     // --- NEW: SEND TO OLLAMA SERVER ---
-//                     let user_text = full_text.trim();
-//                     if !user_text.is_empty() {
-//                         println!("🧠 Thinking (sending to server)...");
+                                messages.push(ChatMessage {
+                                    role: "user".to_string(),
+                                    content: format!("System tool error for '{}': {}", tool_name, e),
+                                });
+                                continue;
+                            }
+                        }
+                    } else {
+                        // Conversational response
+                        log_message(app_state, LogType::Assistant, raw_reply);
 
-//                         // UPDATE THESE TWO LINES:
-//                         let server_url = "http://10.0.0.32:11434/api/chat";
-//                         let model_name = "gemma4:e4b";
+                        {
+                            if let Ok(mut state) = app_state.lock() {
+                                state.agent_state = AgentState::Speaking(raw_reply.to_string());
+                            }
+                        }
 
-//                         let request_body = ChatRequest {
-//                                                 model: model_name.to_string(),
-//                                                 messages: vec![
-//                                                     ChatMessage {
-//                                                         role: "system".to_string(),
-//                                                         // A basic prompt for testing. We will add your JSON "Action Router" prompt later.
-//                                                         content: "You are a helpful, conversational AI. Keep your responses brief and spoken-word friendly.".to_string(),
-//                                                     },
-//                                                     ChatMessage {
-//                                                         role: "user".to_string(),
-//                                                         content: user_text.to_string(),
-//                                                     }
-//                                                 ],
-//                                                 stream: false, // Wait for the full response before proceeding
-//                                             };
+                        // Play TTS
+                        speak(raw_reply);
 
-//                         let client = reqwest::blocking::Client::new();
-//                         match client.post(server_url).json(&request_body).send() {
-//                             Ok(res) => {
-//                                 if let Ok(chat_res) = res.json::<ChatResponse>() {
-//                                     println!("\n🤖 Agent: {}", chat_res.message.content);
-
-//                                     // NEW: Trigger the voice!
-//                                     speak(&chat_res.message.content);
-//                                 } else {
-//                                     eprintln!(
-//                                         "Failed to parse response from Ollama. Did the server return an error?"
-//                                     );
-//                                 }
-//                             }
-//                             Err(e) => eprintln!("Network Error connecting to Ollama: {}", e),
-//                         }
-//                     }
-//                     // --- END OLLAMA INTEGRATION ---
-//                 }
-
-//                 audio_buffer.clear();
-//                 println!("\n🎧 Ready for next input...");
-//             }
-//         }
-//     }
-
-//     Ok(())
-// }
-
-// fn speak(text: &str) {
-//     println!("🔊 Speaking: {}", text);
-
-//     // 1. Start the Piper process
-//     let mut piper = Command::new("piper-tts")
-//         .arg("--model")
-//         .arg("en_US-lessac-medium.onnx")
-//         .arg("--output_raw")
-//         .stdin(Stdio::piped())
-//         .stdout(Stdio::piped())
-//         .spawn()
-//         .expect("Failed to start Piper. Is it installed and in your PATH?");
-
-//     // 2. Feed the text into Piper's stdin
-//     if let Some(mut piper_stdin) = piper.stdin.take() {
-//         piper_stdin
-//             .write_all(text.as_bytes())
-//             .expect("Failed to write to Piper stdin");
-//     }
-
-//     // 3. Wait for Piper to finish generating the raw audio
-//     let piper_output = piper.wait_with_output().expect("Failed to wait on Piper");
-
-//     // 4. Play the raw audio using aplay (Arch Linux standard)
-//     // Piper's medium models output 22050Hz, 16-bit Mono audio
-//     let mut aplay = Command::new("aplay")
-//         .arg("-r")
-//         .arg("22050")
-//         .arg("-f")
-//         .arg("S16_LE")
-//         .arg("-t")
-//         .arg("raw")
-//         .arg("-c")
-//         .arg("1")
-//         .stdin(Stdio::piped())
-//         .stdout(Stdio::null())
-//         .stderr(Stdio::null())
-//         .spawn()
-//         .expect("Failed to start aplay.");
-
-//     // 5. Feed the raw audio into aplay
-//     if let Some(mut aplay_stdin) = aplay.stdin.take() {
-//         aplay_stdin
-//             .write_all(&piper_output.stdout)
-//             .expect("Failed to write to aplay");
-//     }
-
-//     aplay.wait().expect("aplay encountered an error");
-// }
+                        messages.push(ChatMessage {
+                            role: "assistant".to_string(),
+                            content: raw_reply.to_string(),
+                        });
+                        break;
+                    }
+                } else {
+                    let err_msg = "Failed to parse Ollama response body.".to_string();
+                    log_message(app_state, LogType::Error(err_msg.clone()), &err_msg);
+                    break;
+                }
+            }
+            Err(e) => {
+                let err_msg = format!("Failed to connect to Ollama server at {}: {}", current_url, e);
+                log_message(app_state, LogType::Error(err_msg.clone()), &err_msg);
+                break;
+            }
+        }
+    }
+}
