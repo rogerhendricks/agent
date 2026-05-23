@@ -1206,8 +1206,8 @@ fn draw_log_card(ui: &mut egui::Ui, entry: &LogEntry) {
 fn main() -> Result<(), eframe::Error> {
     let shared_state = Arc::new(Mutex::new(AppState {
         config: AppConfig {
-            server_url: "http://127.0.0.1:11434/api/chat".to_string(),
-            model_name: "llama3".to_string(),
+            server_url: "http://10.0.0.32:11434/api/chat".to_string(),
+            model_name: "gemma4:e4b".to_string(),
             searxng_url: "http://localhost:8080".to_string(),
             n8n_url: "".to_string(),
         },
@@ -1266,77 +1266,129 @@ fn run_ai_pipeline(
     audio_rx: Receiver<AiMessage>,
     audio_tx: Sender<AiMessage>,
 ) -> Result<()> {
+    let mut whisper_ctx = None;
+    let mut whisper_state = None;
+
     println!("🤖 Loading Whisper Model...");
     let ctx_params = WhisperContextParameters::default();
-    let ctx = WhisperContext::new_with_params("ggml-tiny.en.bin", ctx_params)
-        .context("Failed to load Whisper model")?;
-    let mut state = ctx.create_state().context("Failed to create state")?;
+    match WhisperContext::new_with_params("ggml-tiny.en.bin", ctx_params) {
+        Ok(ctx) => {
+            let context_stored = whisper_ctx.insert(ctx);
+            match context_stored.create_state() {
+                Ok(state) => {
+                    whisper_state = Some(state);
+                    println!("🤖 Whisper Model Loaded Successfully.");
+                }
+                Err(e) => {
+                    let warn_msg = format!("Failed to create Whisper state: {}. Voice transcription will be disabled.", e);
+                    eprintln!("⚠️ {}", warn_msg);
+                    log_message(&app_state, LogType::Error(warn_msg.clone()), &warn_msg);
+                }
+            }
+        }
+        Err(e) => {
+            let warn_msg = format!("Failed to load Whisper model: {}. Voice transcription will be disabled.", e);
+            eprintln!("⚠️ {}", warn_msg);
+            log_message(&app_state, LogType::Error(warn_msg.clone()), &warn_msg);
+        }
+    }
+
+    let mut _stream = None;
 
     let host = cpal::default_host();
-    let device = host.default_input_device().context("No microphone found")?;
-
-    let stream_config = cpal::StreamConfig {
-        channels: 1,
-        sample_rate: 16000,
-        buffer_size: cpal::BufferSize::Default,
-    };
-
-    let mut is_recording = false;
-    let mut silence_frames = 0;
-    let silence_threshold = 16000;
-
-    let audio_tx_clone = audio_tx.clone();
-    let app_state_audio = app_state.clone();
-
-    let stream = device.build_input_stream(
-        &stream_config,
-        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            // Bypass input checks if BMO is currently playing audio TTS
-            let is_speaking = {
-                if let Ok(state) = app_state_audio.try_lock() {
-                    matches!(state.agent_state, AgentState::Speaking(_))
-                } else {
-                    false
-                }
+    match host.default_input_device() {
+        Some(device) => {
+            let stream_config = cpal::StreamConfig {
+                channels: 1,
+                sample_rate: 16000,
+                buffer_size: cpal::BufferSize::Default,
             };
 
-            if is_speaking {
-                return;
-            }
+            let audio_tx_clone = audio_tx.clone();
+            let app_state_audio = app_state.clone();
 
-            let mut sum_squares = 0.0;
-            for &sample in data {
-                sum_squares += sample * sample;
-            }
-            let rms = (sum_squares / data.len() as f32).sqrt();
+            let mut is_recording = false;
+            let mut silence_frames = 0;
+            let silence_threshold = 16000;
 
-            if rms > 0.015 {
-                if !is_recording {
-                    if let Ok(mut state) = app_state_audio.lock() {
-                        state.agent_state = AgentState::Listening;
+            match device.build_input_stream(
+                &stream_config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    // Bypass input checks if BMO is currently playing audio TTS
+                    let is_speaking = {
+                        if let Ok(state) = app_state_audio.try_lock() {
+                            matches!(state.agent_state, AgentState::Speaking(_))
+                        } else {
+                            false
+                        }
+                    };
+
+                    if is_speaking {
+                        return;
                     }
-                    is_recording = true;
+
+                    let mut sum_squares = 0.0;
+                    for &sample in data {
+                        sum_squares += sample * sample;
+                    }
+                    let rms = (sum_squares / data.len() as f32).sqrt();
+
+                    if rms > 0.015 {
+                        if !is_recording {
+                            if let Ok(mut state) = app_state_audio.lock() {
+                                state.agent_state = AgentState::Listening;
+                            }
+                            is_recording = true;
+                        }
+                        silence_frames = 0;
+                    } else if is_recording {
+                        silence_frames += data.len();
+                    }
+
+                    if is_recording {
+                        let _ = audio_tx_clone.send(AiMessage::AudioData(data.to_vec()));
+                    }
+
+                    if is_recording && silence_frames > silence_threshold {
+                        is_recording = false;
+                        silence_frames = 0;
+                        let _ = audio_tx_clone.send(AiMessage::ProcessAudio);
+                    }
+                },
+                |err| eprintln!("Audio stream error: {}", err),
+                None,
+            ) {
+                Ok(s) => {
+                    match s.play() {
+                        Ok(_) => {
+                            _stream = Some(s);
+                            println!("🎧 Audio Listener Stream Active.");
+                            log_message(
+                                &app_state,
+                                LogType::SystemInfo,
+                                "Microphone audio listener stream successfully started.",
+                            );
+                        }
+                        Err(e) => {
+                            let warn_msg = format!("Failed to start playing audio stream: {}. Voice input will be disabled.", e);
+                            eprintln!("⚠️ {}", warn_msg);
+                            log_message(&app_state, LogType::Error(warn_msg.clone()), &warn_msg);
+                        }
+                    }
                 }
-                silence_frames = 0;
-            } else if is_recording {
-                silence_frames += data.len();
+                Err(e) => {
+                    let warn_msg = format!("Failed to build input audio stream: {}. Voice input will be disabled.", e);
+                    eprintln!("⚠️ {}", warn_msg);
+                    log_message(&app_state, LogType::Error(warn_msg.clone()), &warn_msg);
+                }
             }
-
-            if is_recording {
-                let _ = audio_tx_clone.send(AiMessage::AudioData(data.to_vec()));
-            }
-
-            if is_recording && silence_frames > silence_threshold {
-                is_recording = false;
-                silence_frames = 0;
-                let _ = audio_tx_clone.send(AiMessage::ProcessAudio);
-            }
-        },
-        |err| eprintln!("Audio stream error: {}", err),
-        None,
-    )?;
-
-    stream.play()?;
+        }
+        None => {
+            let warn_msg = "No microphone found or ALSA failed to identify default input device. Voice input will be disabled.".to_string();
+            eprintln!("⚠️ {}", warn_msg);
+            log_message(&app_state, LogType::Error(warn_msg.clone()), &warn_msg);
+        }
+    }
 
     // Skill system setup
     let registry = SkillRegistry::new(app_state.clone());
@@ -1351,8 +1403,6 @@ fn run_ai_pipeline(
     let max_context_messages = 11;
     let mut audio_buffer: Vec<f32> = Vec::new();
 
-    println!("🎧 Audio Listener Stream Active.");
-
     for message in audio_rx {
         match message {
             AiMessage::AudioData(data) => {
@@ -1365,39 +1415,44 @@ fn run_ai_pipeline(
                     }
                 }
 
-                let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-                params.set_language(Some("en"));
-                params.set_print_progress(false);
-                params.set_print_special(false);
-                params.set_print_realtime(false);
-                params.set_print_timestamps(false);
+                if let Some(ref mut whisper_state) = whisper_state {
+                    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+                    params.set_language(Some("en"));
+                    params.set_print_progress(false);
+                    params.set_print_special(false);
+                    params.set_print_realtime(false);
+                    params.set_print_timestamps(false);
 
-                if let Err(e) = state.full(params, &audio_buffer[..]) {
-                    let err_msg = format!("Whisper transcription failed: {}", e);
-                    log_message(&app_state, LogType::Error(err_msg.clone()), &err_msg);
-                } else {
-                    let num_segments = state.full_n_segments();
-                    let mut full_text = String::new();
+                    if let Err(e) = whisper_state.full(params, &audio_buffer[..]) {
+                        let err_msg = format!("Whisper transcription failed: {}", e);
+                        log_message(&app_state, LogType::Error(err_msg.clone()), &err_msg);
+                    } else {
+                        let num_segments = whisper_state.full_n_segments();
+                        let mut full_text = String::new();
 
-                    for i in 0..num_segments {
-                        if let Some(segment) = state.get_segment(i) {
-                            if let Ok(text) = segment.to_str() {
-                                full_text.push_str(text);
+                        for i in 0..num_segments {
+                            if let Some(segment) = whisper_state.get_segment(i) {
+                                if let Ok(text) = segment.to_str() {
+                                    full_text.push_str(text);
+                                }
                             }
                         }
-                    }
 
-                    let user_text = full_text.trim();
-                    if !user_text.is_empty() {
-                        process_user_message(
-                            &app_state,
-                            &registry,
-                            &client,
-                            &mut messages,
-                            max_context_messages,
-                            user_text,
-                        );
+                        let user_text = full_text.trim();
+                        if !user_text.is_empty() {
+                            process_user_message(
+                                &app_state,
+                                &registry,
+                                &client,
+                                &mut messages,
+                                max_context_messages,
+                                user_text,
+                            );
+                        }
                     }
+                } else {
+                    let err_msg = "Whisper transcription is unavailable because the model failed to load.".to_string();
+                    log_message(&app_state, LogType::Error(err_msg.clone()), &err_msg);
                 }
 
                 audio_buffer.clear();
