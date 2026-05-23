@@ -5,10 +5,12 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 // =========================================================================
@@ -224,19 +226,314 @@ impl Skill for N8nTaskSkill {
     }
 }
 
+// --- SKILL 4: WEATHER ---
+struct WeatherSkill;
+impl Skill for WeatherSkill {
+    fn name(&self) -> &'static str {
+        "get_weather"
+    }
+
+    fn description(&self) -> &'static str {
+        "To get current weather conditions for a city/location: {\"action\": \"get_weather\", \"location\": \"<city name>\"}"
+    }
+
+    fn execute(&self, args: &serde_json::Value, _config: &AppConfig) -> Result<String> {
+        let location = args.get("location")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Sydney");
+
+        let url = format!("https://wttr.in/{}?format=j1", location);
+        let client = reqwest::blocking::Client::new();
+        let res = client.get(&url)
+            .send()
+            .context("Failed to connect to weather service")?;
+
+        if !res.status().is_success() {
+            return Err(anyhow!("Weather service returned status code: {}", res.status()));
+        }
+
+        let weather_res: serde_json::Value = res.json().context("Failed to parse weather JSON")?;
+        let temp = weather_res.pointer("/current_condition/0/temp_C")
+            .and_then(|t| t.as_str())
+            .context("Failed to parse temperature")?;
+        let desc = weather_res.pointer("/current_condition/0/weatherDesc/0/value")
+            .and_then(|d| d.as_str())
+            .context("Failed to parse weather description")?;
+        let feel = weather_res.pointer("/current_condition/0/FeelsLikeC")
+            .and_then(|f| f.as_str())
+            .unwrap_or(temp);
+
+        Ok(format!("The current weather in {} is {}, with a temp of {}°C (feels like {}°C).", location, desc, temp, feel))
+    }
+}
+
+// --- SKILL 5: PLAY MUSIC (PLAYERCTL) ---
+struct PlayMusicSkill;
+impl Skill for PlayMusicSkill {
+    fn name(&self) -> &'static str {
+        "play_music"
+    }
+
+    fn description(&self) -> &'static str {
+        "To control system music playback (play, pause, next, previous): {\"action\": \"play_music\", \"playback_action\": \"play|pause|next|previous\"}"
+    }
+
+    fn execute(&self, args: &serde_json::Value, _config: &AppConfig) -> Result<String> {
+        let action = args.get("playback_action")
+            .and_then(|v| v.as_str())
+            .context("Missing 'playback_action' parameter in play_music call")?;
+
+        let valid_action = match action {
+            "play" | "pause" | "next" | "previous" => action,
+            "skip" => "next",
+            "stop" => "pause",
+            _ => return Err(anyhow!("Invalid playback action: {}. Supported: play, pause, next, previous", action)),
+        };
+
+        let mut cmd = Command::new("playerctl");
+        cmd.arg(valid_action);
+
+        let output = cmd.output().context("Failed to execute playerctl command. Is playerctl installed?")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!("playerctl failed: {}", stderr.trim()));
+        }
+
+        Ok(format!("Music playback command dispatched successfully: {}", valid_action))
+    }
+}
+
+// --- SKILL 6: SUB-AGENT COGNITIVE PATTERN ---
+struct SubAgentSkill {
+    app_state: Arc<Mutex<AppState>>,
+}
+
+impl SubAgentSkill {
+    fn new(app_state: Arc<Mutex<AppState>>) -> Self {
+        Self { app_state }
+    }
+}
+
+impl Skill for SubAgentSkill {
+    fn name(&self) -> &'static str {
+        "run_sub_task"
+    }
+
+    fn description(&self) -> &'static str {
+        "To delegate a complex multi-step task or research to a focused sub-agent: {\"action\": \"run_sub_task\", \"task\": \"<detailed task description>\"}"
+    }
+
+    fn execute(&self, args: &serde_json::Value, config: &AppConfig) -> Result<String> {
+        let task = args.get("task")
+            .and_then(|v| v.as_str())
+            .context("Missing 'task' parameter in run_sub_task call")?;
+
+        log_message(
+            &self.app_state,
+            LogType::SystemInfo,
+            &format!("🧠 Sub-Agent spawned to solve task: \"{}\"", task),
+        );
+
+        let summary = run_sub_agent_loop(&self.app_state, config, task)?;
+        Ok(summary)
+    }
+}
+
+fn run_sub_agent_loop(
+    app_state: &Arc<Mutex<AppState>>,
+    config: &AppConfig,
+    task: &str,
+) -> Result<String> {
+    let client = reqwest::blocking::Client::new();
+
+    let sub_system_prompt = "\
+        You are a focused research sub-agent. Your goal is to solve the following user task:\n\n\
+        USER TASK: \"[TASK_GOAL]\"\n\n\
+        You must analyze the task step-by-step. You have access to the following tools to gather information:\n\
+        - To search the web: {\"action\": \"web_search\", \"query\": \"<query>\"}\n\
+        - To get current time: {\"action\": \"get_time\"}\n\n\
+        RULES:\n\
+        1. Keep your reasoning efficient. Solve the task in the minimum number of steps.\n\
+        2. To use a tool, reply ONLY with a raw JSON object and no other text.\n\
+        3. If you have gathered all necessary information and are ready to provide a final consolidated report to the parent agent, you MUST reply ONLY with a JSON object calling the 'done' action:\n\
+           {\"action\": \"done\", \"summary\": \"<detailed conversational summary and answer to the user's task>\"}\n\n\
+        Stay focused and complete the task.";
+
+    let system_content = sub_system_prompt.replace("[TASK_GOAL]", task);
+
+    let mut sub_messages = vec![ChatMessage {
+        role: "system".to_string(),
+        content: system_content,
+    }];
+
+    // Create a local mini-registry for the sub-agent
+    let mut sub_registry = std::collections::HashMap::new();
+    sub_registry.insert("web_search".to_string(), Box::new(WebSearchSkill) as Box<dyn Skill>);
+    sub_registry.insert("get_time".to_string(), Box::new(GetTimeSkill) as Box<dyn Skill>);
+
+    let max_iterations = 4;
+    let mut current_iteration = 0;
+
+    while current_iteration < max_iterations {
+        current_iteration += 1;
+
+        log_message(
+            app_state,
+            LogType::SystemInfo,
+            &format!("🧠 Sub-Agent Step {}/{}", current_iteration, max_iterations),
+        );
+
+        let request_body = ChatRequest {
+            model: config.model_name.clone(),
+            messages: sub_messages.clone(),
+            stream: false,
+        };
+
+        let res = client.post(&config.server_url)
+            .json(&request_body)
+            .send()
+            .context("Sub-agent failed to connect to Ollama server")?;
+
+        if !res.status().is_success() {
+            return Err(anyhow!("Sub-agent Ollama server returned error status: {}", res.status()));
+        }
+
+        let chat_res: ChatResponse = res.json().context("Failed to parse sub-agent Ollama response JSON")?;
+        let raw_reply = chat_res.message.content.trim();
+        let cleaned_reply = clean_json_string(raw_reply);
+
+        if let Ok(action_call) = serde_json::from_str::<GenericActionCall>(&cleaned_reply) {
+            let tool_name = action_call.action.clone();
+            
+            if tool_name == "done" {
+                let summary = action_call.parameters.get("summary")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or(raw_reply);
+                
+                log_message(
+                    app_state,
+                    LogType::SystemInfo,
+                    &format!("🧠 Sub-Agent successfully completed task!"),
+                );
+                return Ok(summary.to_string());
+            }
+
+            if let Some(sub_skill) = sub_registry.get(&tool_name) {
+                let tool_args = action_call.parameters.to_string();
+
+                log_message(
+                    app_state,
+                    LogType::ToolCall {
+                        name: format!("sub-agent::{}", tool_name),
+                        args: tool_args,
+                    },
+                    &format!("🧠 Sub-Agent triggering skill '{}'...", tool_name),
+                );
+
+                let skill_result = sub_skill.execute(&action_call.parameters, config);
+
+                match skill_result {
+                    Ok(result_str) => {
+                        log_message(
+                            app_state,
+                            LogType::ToolResult {
+                                name: format!("sub-agent::{}", tool_name),
+                                result: result_str.clone(),
+                            },
+                            &format!("🧠 Sub-Agent skill '{}' completed.", tool_name),
+                        );
+
+                        sub_messages.push(ChatMessage {
+                            role: "assistant".to_string(),
+                            content: raw_reply.to_string(),
+                        });
+
+                        sub_messages.push(ChatMessage {
+                            role: "user".to_string(),
+                            content: format!("System tool observation: {}", result_str),
+                        });
+                    }
+                    Err(e) => {
+                        log_message(
+                            app_state,
+                            LogType::Error(format!("🧠 Sub-Agent skill '{}' failed: {}", tool_name, e)),
+                            &format!("🧠 Sub-Agent skill '{}' failed.", tool_name),
+                        );
+
+                        sub_messages.push(ChatMessage {
+                            role: "assistant".to_string(),
+                            content: raw_reply.to_string(),
+                        });
+
+                        sub_messages.push(ChatMessage {
+                            role: "user".to_string(),
+                            content: format!("System tool error: {}", e),
+                        });
+                    }
+                }
+            } else {
+                sub_messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: raw_reply.to_string(),
+                });
+                sub_messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: format!("Tool '{}' is not available in sub-agent scope. You can only call 'web_search', 'get_time', or 'done'.", tool_name),
+                });
+            }
+        } else {
+            log_message(
+                app_state,
+                LogType::SystemInfo,
+                &format!("🧠 Sub-Agent completed task with plain reply."),
+            );
+            return Ok(raw_reply.to_string());
+        }
+    }
+
+    log_message(
+        app_state,
+        LogType::SystemInfo,
+        &format!("🧠 Sub-Agent reached safety limit of {} steps. Merging findings.", max_iterations),
+    );
+
+    sub_messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: "You have reached the maximum steps. Provide the best possible consolidated summary of your research so far.".to_string(),
+    });
+
+    let request_body = ChatRequest {
+        model: config.model_name.clone(),
+        messages: sub_messages,
+        stream: false,
+    };
+
+    if let Ok(res) = client.post(&config.server_url).json(&request_body).send() {
+        if let Ok(chat_res) = res.json::<ChatResponse>() {
+            return Ok(chat_res.message.content.trim().to_string());
+        }
+    }
+
+    Ok("Sub-agent reached reasoning limit but was unable to compile a final summary.".to_string())
+}
+
 // --- SKILL REGISTRY CONTAINER ---
 struct SkillRegistry {
     skills: std::collections::HashMap<String, Box<dyn Skill>>,
 }
 
 impl SkillRegistry {
-    fn new() -> Self {
+    fn new(app_state: Arc<Mutex<AppState>>) -> Self {
         let mut registry = Self {
             skills: std::collections::HashMap::new(),
         };
         registry.register(Box::new(GetTimeSkill));
         registry.register(Box::new(WebSearchSkill));
         registry.register(Box::new(N8nTaskSkill));
+        registry.register(Box::new(WeatherSkill));
+        registry.register(Box::new(PlayMusicSkill));
+        registry.register(Box::new(SubAgentSkill::new(app_state)));
         registry
     }
 
@@ -279,7 +576,7 @@ fn clean_json_string(raw: &str) -> String {
     cleaned.trim().to_string()
 }
 
-fn speak(text: &str) {
+fn speak(text: &str, app_state: &Arc<Mutex<AppState>>) {
     println!("🔊 Speaking: {}", text);
     let piper = Command::new("piper-tts")
         .arg("--model")
@@ -292,6 +589,11 @@ fn speak(text: &str) {
     let mut piper_process = match piper {
         Ok(p) => p,
         Err(e) => {
+            log_message(
+                app_state,
+                LogType::Error(format!("Failed to start piper-tts: {}", e)),
+                "Speech output failed: could not launch piper-tts",
+            );
             eprintln!("Failed to start piper-tts. Is it installed? Error: {}", e);
             return;
         }
@@ -299,6 +601,11 @@ fn speak(text: &str) {
 
     if let Some(mut piper_stdin) = piper_process.stdin.take() {
         if let Err(e) = piper_stdin.write_all(text.as_bytes()) {
+            log_message(
+                app_state,
+                LogType::Error(format!("Failed to write text to piper-tts: {}", e)),
+                "Speech output failed while streaming text to piper-tts",
+            );
             eprintln!("Failed to write text to Piper: {}", e);
             return;
         }
@@ -307,10 +614,33 @@ fn speak(text: &str) {
     let piper_output = match piper_process.wait_with_output() {
         Ok(out) => out,
         Err(e) => {
+            log_message(
+                app_state,
+                LogType::Error(format!("Failed to wait for piper-tts output: {}", e)),
+                "Speech output failed while waiting for piper-tts",
+            );
             eprintln!("Failed to wait on Piper execution: {}", e);
             return;
         }
     };
+
+    if !piper_output.status.success() {
+        let stderr = String::from_utf8_lossy(&piper_output.stderr).trim().to_string();
+        log_message(
+            app_state,
+            LogType::Error(format!("piper-tts exited with status {}", piper_output.status)),
+            &format!(
+                "Speech output failed: piper-tts returned {}{}",
+                piper_output.status,
+                if stderr.is_empty() {
+                    "".to_string()
+                } else {
+                    format!(" ({})", stderr)
+                }
+            ),
+        );
+        return;
+    }
 
     let aplay = Command::new("aplay")
         .arg("-r")
@@ -329,6 +659,11 @@ fn speak(text: &str) {
     let mut aplay_process = match aplay {
         Ok(a) => a,
         Err(e) => {
+            log_message(
+                app_state,
+                LogType::Error(format!("Failed to start aplay: {}", e)),
+                "Speech output failed: could not launch aplay",
+            );
             eprintln!("Failed to start aplay. Is it installed? Error: {}", e);
             return;
         }
@@ -336,10 +671,33 @@ fn speak(text: &str) {
 
     if let Some(mut aplay_stdin) = aplay_process.stdin.take() {
         if let Err(e) = aplay_stdin.write_all(&piper_output.stdout) {
+            log_message(
+                app_state,
+                LogType::Error(format!("Failed to pipe audio to aplay: {}", e)),
+                "Speech output failed while piping audio to aplay",
+            );
             eprintln!("Failed to pipe audio buffer to aplay: {}", e);
         }
     }
-    let _ = aplay_process.wait();
+
+    match aplay_process.wait() {
+        Ok(status) => {
+            if !status.success() {
+                log_message(
+                    app_state,
+                    LogType::Error(format!("aplay exited with status {}", status)),
+                    &format!("Speech output failed: aplay returned {}", status),
+                );
+            }
+        }
+        Err(e) => {
+            log_message(
+                app_state,
+                LogType::Error(format!("Failed waiting on aplay: {}", e)),
+                "Speech output failed while waiting for aplay",
+            );
+        }
+    }
 }
 
 fn log_message(app_state: &Arc<Mutex<AppState>>, log_type: LogType, text: &str) {
@@ -349,6 +707,134 @@ fn log_message(app_state: &Arc<Mutex<AppState>>, log_type: LogType, text: &str) 
             text: text.to_string(),
             timestamp: chrono::Local::now(),
         });
+    }
+}
+
+fn command_in_path(command: &str) -> bool {
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+
+    std::env::split_paths(&path_var).any(|path| path.join(command).exists())
+}
+
+fn run_startup_checks(app_state: &Arc<Mutex<AppState>>) {
+    let required_files = ["ggml-tiny.en.bin", "bmo.onnx", "bmo.onnx.json"];
+    for file in required_files {
+        if Path::new(file).exists() {
+            log_message(
+                app_state,
+                LogType::SystemInfo,
+                &format!("Startup check: Found required file '{}'", file),
+            );
+        } else {
+            log_message(
+                app_state,
+                LogType::Error(format!("Missing required file: {}", file)),
+                &format!("Startup check failed: Missing required file '{}'", file),
+            );
+        }
+    }
+
+    let required_commands = ["piper-tts", "aplay", "playerctl"];
+    for cmd in required_commands {
+        if command_in_path(cmd) {
+            log_message(
+                app_state,
+                LogType::SystemInfo,
+                &format!("Startup check: Found command '{}'", cmd),
+            );
+        } else {
+            log_message(
+                app_state,
+                LogType::Error(format!("Command '{}' was not found in PATH", cmd)),
+                &format!("Startup warning: '{}' is not installed or not in PATH", cmd),
+            );
+        }
+    }
+
+    let host = cpal::default_host();
+    if host.default_input_device().is_some() {
+        log_message(
+            app_state,
+            LogType::SystemInfo,
+            "Startup check: Microphone input device detected",
+        );
+    } else {
+        log_message(
+            app_state,
+            LogType::Error("No microphone input device was detected".to_string()),
+            "Startup warning: No default microphone input device detected",
+        );
+    }
+
+    let server_url = if let Ok(state) = app_state.lock() {
+        state.config.server_url.clone()
+    } else {
+        String::new()
+    };
+
+    if server_url.is_empty() {
+        log_message(
+            app_state,
+            LogType::Error("Ollama URL is empty".to_string()),
+            "Startup warning: Ollama URL is empty; open Settings and configure it",
+        );
+        return;
+    }
+
+    let health_url = if server_url.ends_with("/api/chat") {
+        server_url.replace("/api/chat", "/api/tags")
+    } else {
+        format!("{}/api/tags", server_url.trim_end_matches('/'))
+    };
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build();
+
+    match client {
+        Ok(client) => match client.get(&health_url).send() {
+            Ok(res) => {
+                if res.status().is_success() {
+                    log_message(
+                        app_state,
+                        LogType::SystemInfo,
+                        &format!("Startup check: Ollama reachable at {}", health_url),
+                    );
+                } else {
+                    log_message(
+                        app_state,
+                        LogType::Error(format!(
+                            "Ollama health check failed with status {}",
+                            res.status()
+                        )),
+                        &format!(
+                            "Startup warning: Ollama responded with {} at {}",
+                            res.status(),
+                            health_url
+                        ),
+                    );
+                }
+            }
+            Err(e) => {
+                log_message(
+                    app_state,
+                    LogType::Error(format!("Could not reach Ollama health endpoint: {}", e)),
+                    &format!(
+                        "Startup warning: Could not reach Ollama at {}",
+                        health_url
+                    ),
+                );
+            }
+        },
+        Err(e) => {
+            log_message(
+                app_state,
+                LogType::Error(format!("Could not build HTTP client for startup checks: {}", e)),
+                "Startup warning: HTTP client creation failed during Ollama preflight",
+            );
+        }
     }
 }
 
@@ -733,6 +1219,8 @@ fn main() -> Result<(), eframe::Error> {
         agent_state: AgentState::Idle,
     }));
 
+    run_startup_checks(&shared_state);
+
     let (ai_tx, ai_rx) = mpsc::channel::<AiMessage>();
 
     let ai_state = shared_state.clone();
@@ -740,7 +1228,13 @@ fn main() -> Result<(), eframe::Error> {
 
     // Spawn AI Pipeline Background thread
     thread::spawn(move || {
-        if let Err(e) = run_ai_pipeline(ai_state, ai_rx, ai_tx_for_audio) {
+        let pipeline_state = ai_state.clone();
+        if let Err(e) = run_ai_pipeline(pipeline_state, ai_rx, ai_tx_for_audio) {
+            log_message(
+                &ai_state,
+                LogType::Error(format!("AI pipeline crashed: {}", e)),
+                &format!("AI pipeline stopped: {}", e),
+            );
             eprintln!("AI Pipeline crashed: {}", e);
         }
     });
@@ -845,7 +1339,7 @@ fn run_ai_pipeline(
     stream.play()?;
 
     // Skill system setup
-    let registry = SkillRegistry::new();
+    let registry = SkillRegistry::new(app_state.clone());
     let system_prompt = registry.generate_system_prompt();
 
     let mut messages = vec![ChatMessage {
@@ -1081,7 +1575,7 @@ fn process_user_message(
                         }
 
                         // Play TTS
-                        speak(raw_reply);
+                        speak(raw_reply, app_state);
 
                         messages.push(ChatMessage {
                             role: "assistant".to_string(),

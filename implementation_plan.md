@@ -1,75 +1,57 @@
-# Implementation Plan: Extensible Console Agent with SearXNG and Premium GUI
+# Implementation Plan: Stabilization and Runtime Hardening
 
-This plan details the implementation of a highly extensible voice agent in Rust. It defines a dynamic skill registry, integrates your self-hosted **SearXNG** search instance, supports **n8n webhooks**, resolves existing compile issues, and upgrades the Egui GUI to a state-of-the-art interface.
+This document reflects the current state of the project and defines the remaining work to make the app reliably runnable end-to-end.
 
-## User Review Required
+## Current State Summary
 
-> [!IMPORTANT]
-> **ALSA Development Library Dependency (Fedora Linux)**
-> During check, compilation failed because the system library `alsa` is missing. 
-> To resolve this, you need to install the ALSA development package on Fedora:
-> ```bash
-> sudo dnf install -y alsa-lib-devel
-> ```
-> Please confirm if you would like me to run this installation for you or if you prefer to run it yourself.
+Implemented in `src/main.rs`:
+- Trait-based skill registry with dynamic JSON tool dispatch.
+- Skills: `get_time`, `web_search` (SearXNG), `n8n_task`, `get_weather`, `play_music`, `run_sub_task`.
+- Egui desktop UI with animated face visualizer, settings panel, text input, and scrollable activity log.
+- Voice pipeline: microphone capture -> Whisper STT -> Ollama reasoning -> tool execution -> Piper TTS.
 
-> [!NOTE]
-> **SearXNG Integration**
-> We will query SearXNG using its native JSON API: `https://<searxng-url>/search?q=<query>&format=json`.
-> We will add a **SearXNG URL** input field to the GUI settings panel so you can easily configure it (e.g. `http://localhost:8080` or your custom domain).
+Recently added hardening:
+- Startup preflight checks for required files and runtime commands.
+- Startup microphone detection.
+- Startup Ollama reachability check.
+- GUI log visibility for AI pipeline crashes and TTS playback failures.
 
-## Proposed Changes
+## Remaining Work
 
-We will restructure `src/main.rs` to clean up syntax issues, implement the extensible skill system, support SearXNG and n8n, and upgrade the GUI.
+### Phase 1: Runtime Validation
+1. Run `cargo run --release` with all local dependencies available.
+2. Confirm startup checks appear in the UI log and correctly report failures.
+3. Verify no immediate panic if optional integrations are unavailable.
 
-### Extensible Skill Architecture
+### Phase 2: End-to-End Behavior Tests
+1. Test text flow first:
+   - Ask for time.
+   - Trigger web search.
+   - Trigger weather lookup.
+2. Test command-dependent skills:
+   - Trigger `play_music` with `play`/`pause`.
+   - Trigger `n8n_task` with configured webhook.
+3. Test voice flow once text is stable.
 
-We'll define a `Skill` trait and a thread-safe registry:
+### Phase 3: Scope Decisions
+1. Decide whether `run_sub_task` remains enabled by default.
+2. Decide whether to keep `play_music` if `playerctl` is missing on target machines.
+3. Defer persistence and packaging until baseline runtime is consistently stable.
 
-```rust
-pub trait Skill: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn description(&self) -> &'static str;
-    fn execute(&self, args: &serde_json::Value, config: &AppConfig) -> Result<String>;
-}
-```
+### Phase 4: Documentation Maintenance
+1. Keep README and walkthrough synchronized with the code and startup checks.
+2. Keep this plan focused on remaining work only.
 
-We will implement three default skills:
-1. **GetTimeSkill**: Returns local system time.
-2. **WebSearchSkill**: Queries your custom **SearXNG** instance via JSON and formats the top 3-4 results for the LLM.
-3. **N8nTaskSkill**: Sends custom task payloads to your self-hosted **n8n** webhook URL.
+## Verification Checklist
 
----
+Automated:
+1. `cargo check`
+2. `cargo run --release`
 
-### File Changes
-
-#### [MODIFY] [main.rs](file:///home/roger/Projects/agent/src/main.rs)
-
-We will update `src/main.rs` to do the following:
-1. **Fix Compile Errors**: Remove syntax noise (e.g. the stray `Agent` / `agent` around line 30).
-2. **Implement Skill Registry**:
-   - `Skill` trait and registry.
-   - Dynamic prompt generation and dynamic dispatch for actions.
-3. **Enhance AppConfig**:
-   - Add `searxng_url` and `n8n_url` to `AppConfig` and register the skills.
-4. **Upgrade GUI (Egui)**:
-   - Integrate a premium dark-themed layout.
-   - Add settings input fields for Ollama URL, Model, SearXNG URL, and n8n webhook URL.
-   - Include a scrollable, colorful conversation log showing user transcripts, active tool execution statuses, and AI replies.
-   - Provide a manual message text box in case the user wants to type commands instead of using the mic.
-
----
-
-## Verification Plan
-
-### Automated Verification
-Once ALSA development headers are installed, we will run:
-- `cargo check` to verify types and dependencies.
-- `cargo build` to ensure the binary compiles successfully.
-- `cargo run` to start the interface.
-
-### Manual Verification
-1. **Time Skill**: Trigger by speaking "What time is it?" or typing it in. Observe the console log showing `get_time` call and response.
-2. **SearXNG Web Search**: Configure your SearXNG URL (e.g. `http://localhost:8080`) and trigger by asking "Search for Rust news". Verify that the SearXNG API is queried successfully and the results are printed.
-3. **n8n Workflow**: Configure n8n Webhook URL and say "Run n8n automation for sending email". Verify that the request is successfully dispatched to the endpoint.
-4. **Voice Feedback**: Verify Piper TTS reads out responses in real time.
+Manual:
+1. Type: "What time is it?" and confirm tool call, tool result, final assistant response, and TTS attempt.
+2. Type: "Search for Rust news" and confirm SearXNG results are returned.
+3. Type: "What is the weather in Tokyo?" and confirm weather output.
+4. Type: "Pause music" and confirm `playerctl` path works or reports a clear error.
+5. Configure n8n URL and trigger an automation request.
+6. Use a short voice prompt and confirm STT -> LLM -> TTS cycle.
